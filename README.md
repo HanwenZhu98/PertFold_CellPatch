@@ -84,3 +84,37 @@ GPU=0 ./run_r4.sh 0 1
 - `splithalf/data/H1.h5ad`（评估用的原始计数）；
 - `backbone/cell_eval_vcc2026_base.yaml`；
 - `pertfold/runs3/split_811_ref`（STRING kNN 基线）。
+
+## 六、版本管理（GitHub）
+- **仓库：** https://github.com/HanwenZhu98/PertFold_CellPatch（private），分支 `main`。
+- **认证：** HTTPS + classic token（`repo` 权限），已存在 `~/.git-credentials`，所有节点通用；token 过期后重新生成，下次 push 时输入新的即可。
+- **只管代码：** `checkpoints/`、`runs/`、`*.npz`、`*.pt`、`*.log` 等都在 `.gitignore` 里，不上传。结果和权重留在集群上，记录里写明产生它们的 commit。
+
+**日常保存：**
+```bash
+cd /cluster2/home/hanwen/vcc_26/pertfold_r4
+git add -A
+git commit -m "改了什么、为什么"
+git push
+```
+
+**效果好的版本打标签：**
+```bash
+git tag -a r4-v1 -m "一句话说明：配置 + 关键结果（如 5 折 PDS）"
+git push --tags
+```
+- 标签命名：`r4-v<序号>`，按顺序递增；说明里写结果，方便以后对照。
+- 跑重要实验前先 commit，在日志里记下 `git rev-parse --short HEAD`。
+
+**查看 / 回退：**
+```bash
+git log --oneline --decorate     # 历史与标签
+git tag -n                       # 所有标签及说明
+git diff r4-v1                   # 当前代码与某个标签的差别
+git switch --detach r4-v1        # 临时切到某个版本（看完 git switch main 回来）
+```
+
+**版本记录：**
+| 标签 | 日期 | 说明 |
+|---|---|---|
+| — | 2026-10-22 | 初始提交：R4 代码原样整理（`878978c`） |
