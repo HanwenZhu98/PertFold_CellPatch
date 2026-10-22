@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+checkpoints/
+runs/
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.h5ad
+*.log
