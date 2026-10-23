@@ -55,11 +55,46 @@ def adata(X, targets):
                                                     index=[f"c{i}" for i in range(X.shape[0])]))
 
 
+SLOTS = 8                 # 10-22：全局最多同时跑的打分数（每个约 25 GB 内存）
+MEM_MIN_GB = 60           # 开始前要求的可用内存
+SLOT_DIR = Path("/cluster2/home/hanwen/vcc_26/pertfold/analysis/single_line/logs/eval_slots")
+
+
+START_HOLD = 180          # 启动锁持有秒数：等本进程内存涨到峰值，下一个才开始检查可用内存
+
+
+def acquire_slot():
+    """文件锁信号量：先拿 SLOTS 个槽之一，再拿启动锁（串行启动）并等可用内存 ≥ MEM_MIN_GB；
+    启动锁在 START_HOLD 秒后释放，槽持有到进程结束（锁随进程退出自动释放）"""
+    import fcntl
+    import threading
+    SLOT_DIR.mkdir(parents=True, exist_ok=True)
+    fh = None
+    while fh is None:
+        for i in range(SLOTS):
+            h = open(SLOT_DIR / f"slot{i}", "w")
+            try:
+                fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fh = h
+                break
+            except BlockingIOError:
+                h.close()
+        if fh is None:
+            time.sleep(30)
+    st = open(SLOT_DIR / "start", "w")
+    fcntl.flock(st, fcntl.LOCK_EX)
+    while int(next(l for l in open("/proc/meminfo") if l.startswith("MemAvailable")).split()[1]) / 2 ** 20 < MEM_MIN_GB:
+        time.sleep(30)
+    threading.Timer(START_HOLD, st.close).start()
+    return fh
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pred")
     ap.add_argument("--identity", action="store_true")
     args = ap.parse_args()
+    slot = acquire_slot()  # noqa: F841（持有到进程结束）
     t0 = time.time()
     meta = json.loads(META.read_text())
     perts, col = meta["perts"], np.array(meta["gene_col"])

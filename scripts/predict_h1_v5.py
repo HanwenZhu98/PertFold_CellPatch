@@ -1,4 +1,6 @@
-"""v5 模型（pertfold3/model_v5.py）的预测：同 predict_h1_v3.py，另给 N1 的邻居输入，并多两种读出：
+"""v10（2026-10-22 晚）：训练时 --space bulk 的模型（data.json 的 space）按打分空间建证据；npz 另存 dhat（读出的 δ̂，打分空间）
+与 space 字段，供 eval_bulk_h1.py 打分（yhat = xbar + δ̂ 在打分空间没有意义，只为兼容保留）。打分空间模型用 --readout cont（连续头）或 nbw。
+v5 模型（pertfold3/model_v5.py）的预测：同 predict_h1_v3.py，另给 N1 的邻居输入，并多两种读出：
   --readout cont   N2 连续头（δ = dp_cont · s_dp）
   --readout nbw    只用 N1 学到的权重 a_k 对邻居真实 delta_p 加权平均（不经过 decoder，"学习权重的 kNN"）
 以下为 predict_h1_v3.py 说明。
@@ -82,6 +84,10 @@ def main():
         data.ev_mode = dset.get("ev_mode", "delta")                                # B2：证据空间与训练相同
         if data.ev_mode == "fc" and not hasattr(data, "mu_counts"):
             data.build_aug_tables()
+        if dset.get("space", "dp") == "bulk" and data.space != "bulk":            # v10：打分空间的标签与证据
+            data.use_bulk()
+        if dset.get("space", "dp") != data.space:
+            raise SystemExit("各折模型的空间不一致")
         data.set_evidence(torch.tensor(tr, device=dev), dset.get("relation", "string"))   # 本模型训练扰动中的邻居与证据
         ev = data.evidence if dset.get("use_evidence", True) else None
         nbd = data.nb_inputs(torch.tensor(te, device=dev), with_c=False) if m.c.nb_learn else None   # 只依赖训练扰动的标签
@@ -97,6 +103,7 @@ def main():
         real_idx = np.stack([g.choice(cells[p], n, replace=False) for p in range(P)])
         xbar = data.X[torch.from_numpy(x_idx).to(dev)].mean(1)                     # [P, G]
         yhat = torch.empty_like(xbar)
+        dhat = torch.zeros_like(xbar)                                              # v10：读出的 δ̂（模型的空间）
         de_prob = torch.zeros_like(xbar)                                           # DE 头：P(DE)
         dp_prob = None                                                             # delta 分箱的 softmax 概率 [P, G, K]
         for m, sidx, smask, (ev, nbd), te in models:
@@ -117,6 +124,8 @@ def main():
                       nb=None if nbd is None else nbd[1])                    # nbd 按同一个 te 顺序构建
             if args.readout == "exp":
                 d = o.delta.float() if o.dp_logits is None else o.dp_logits.float().softmax(-1) @ dp_centers(m.c, dev)   # v7 affine
+                if o.dp_base is not None and o.dp_logits is not None:              # v8 nb_resid：δ̂ = nbw + E[残差]
+                    d = d + o.dp_base.float()
             elif args.readout == "cont":
                 d = o.dp_cont.float() * m.s_dp
             elif args.readout == "nbw":
@@ -127,6 +136,7 @@ def main():
             else:
                 d = o.delta.float()
             yhat[t] = xbar[t] + d                                                   # y_hat = x + delta（fp32 相加）
+            dhat[t] = d
             de_prob[t] = o.de_logits.float().softmax(-1)[..., 1]
             if o.dp_logits is None:                                                # v7 affine：没有分箱概率
                 dp_prob = False
@@ -140,7 +150,8 @@ def main():
         out = runs / f"n{n}" / f"pred_{args.tag or 'model'}_{Path(args.ckpt).stem}{suffix}_rep{r}.npz"
         extra = {"dp_prob": dp_prob[keep].half().cpu().numpy()} if dp_prob is not False else {}
         np.savez(out, perts=keep, x_idx=x_idx[keep], real_idx=real_idx[keep], ctrl_pred=ctrl_pred, ctrl_real=ctrl_real,
-                 xbar=xbar[keep].cpu().numpy(), yhat=yhat[keep].cpu().numpy(), de_prob=de_prob[keep].cpu().numpy(), **extra)
+                 xbar=xbar[keep].cpu().numpy(), yhat=yhat[keep].cpu().numpy(), de_prob=de_prob[keep].cpu().numpy(),
+                 dhat=dhat[keep].cpu().numpy(), space=data.space, **extra)
         print(f"n={n} rep {r} → {out}", flush=True)
 
 

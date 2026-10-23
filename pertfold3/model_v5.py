@@ -1,4 +1,23 @@
-"""v7 开关（2026-10-21，用户的设计，见 pertfold/PLAN_v7_1021.md；默认全关 = v6）：
+"""v11（2026-10-22 晚，用户要求：证据直通 decoder，与 r4 对比；不改原有路径）：
+  PertFold3.encode_z  只算 backbone（①②③），返回 decoder 读的 z（同 forward 的 cell_patch_y_hat；不支持 no_encoder / input_mask / const_z）
+  PassDecoder         δ̂_g = (1 + a_g)·base_g + s·c_g；[a_g, c_g] = MLP([h_g, f_g])，最后一层零初始化（初始 δ̂ = base，即证据本身）；
+                      h_g = LN(CrossAttn(LN(Linear(esm_g)), z))，esm 为固定的标准化 ESM（输出基因可以多于 encoder 的输入基因）
+v10 开关（2026-10-22 晚，用户要求：标签 / 证据 / 输出统一到打分空间；loss 先用 MSE + nb loss，再试 ZINB；默认 = v9）：
+  recon_loss   "pie"（原四项）| "mse" | "zinb"。后两者需要 cont_head：连续头输出打分空间的 δ̂ / s_dp
+               （打分空间 = log1p(5e4 · 伪 bulk 表达比例)，δ = 扰动 − 对照；训练脚本 --space bulk 提供标签 labels["dB"]）。
+               mse   MSE(δ̂ / s_dp, δ / s_dp)，只算 labels["gmask"]（对照有表达、且不是本扰动靶基因）的格子
+               zinb  该扰动 n 个细胞计数（labels["counts"] [B, n, G]，文库 labels["lib"] [B, n]）的 ZINB 负对数似然：
+                     群体比例 q̂ = expm1(softplus₅₀(b_c + δ̂)) / 5e4（b_c = 全部对照的打分空间伪 bulk，labels["bc"]），
+                     NB 均值 = 文库 · q̂ / (1 − π)（使 ZINB 均值 = 文库 · q̂）；θ 每基因一个参数（log_theta），π 由 decoder 的 zi 头给出
+               两者都不再用 DE / LFC / 分箱三个头（仍然建，不进 loss）；delta 读出 = 连续头 × s_dp
+v9 开关（2026-10-22，用户要求：按 loss 情况加权约束过大的 loss；试 PDS loss 与 MSE loss；默认 = v8）：
+  w_de / w_lfc / w_dir / w_dp  pie_loss 四项的权重（默认 1）。诊断（diag_decoder_loss.py）：前 500 步 lfc_dir 对共享层的梯度是 dp 的 20–50 倍
+  mse_weight   期望读出 δ̂（+ nb_resid 时的 nbw）对群体 delta_p 的 MSE（都除以 s_dp，去掉靶基因列），只在 recon 阶段
+  PDS loss 用已有的 disc_weight（D，批内 InfoNCE）；nb_resid 时 δ̂ 加上 nbw
+v8 开关（2026-10-22，用户要求测试"残差输出"；默认关）：
+  nb_resid     delta_p 分箱头改学残差 r = delta_p − nbw（nbw = a_k 加权的邻居 δ，停梯度）；读出 δ̂ = nbw + E[r]（argmax 时 nbw + 箱中心）；
+               分箱头最后一层零初始化 → 初始 δ̂ = nbw。没有邻居的行 nbw = 0，与原来相同。需要 nb_learn。
+v7 开关（2026-10-21，用户的设计，见 pertfold/docs/plans/PLAN_v7_1021.md；默认全关 = v6）：
   dec_type     "xattn"（原：基因查询 cross-attention + 三个分箱头）| "xattn_sa"（另加 2 层基因 self-attention）|
                "affine"（CellPatch2_perturb_newdecoder：基因 token cross-attention → 2 层基因 self-attention →
                AffineExprDecoder ŷ = softplus(a)·x_ctrl + b；MSE(ŷ, x + delta_p) + DE 两类交叉熵；读出 δ̂ = ŷ − x）
@@ -175,6 +194,15 @@ class Config3:
     ctrl_jepa_ratio: float = 0.3
     input_mask: float = 0.0
     affine_id: bool = False
+    nb_resid: bool = False               # v8：分箱头学 delta_p − nbw
+    # v9 开关（默认 = v8）
+    w_de: float = 1.0
+    w_lfc: float = 1.0
+    w_dir: float = 1.0
+    w_dp: float = 1.0
+    mse_weight: float = 0.0
+    # v10 开关（默认 = v9）
+    recon_loss: str = "pie"              # "pie" | "mse" | "zinb"
 
 
 class FFN(nn.Module):
@@ -495,6 +523,9 @@ class Decoder(nn.Module):
         self.de = nn.Linear(d, 2)
         self.lfc = nn.Linear(d, 1)
         self.dp = nn.Linear(d, max(c.dp_bins, 1))
+        if c.nb_resid:                                                           # v8：初始残差 E[r] = 0（各箱等概率，箱中心对称）
+            nn.init.zeros_(self.dp.weight)
+            nn.init.zeros_(self.dp.bias)
         self.evidence = Evidence(c)
         self.query_adapter = zero_last(nn.Sequential(nn.Linear(dim, 2 * dim), nn.SiLU(), nn.Linear(2 * dim, d, bias=False)))
         heads = ("de", "lfc", "dp", "cont") if c.cont_head else ("de", "lfc", "dp")
@@ -502,12 +533,21 @@ class Decoder(nn.Module):
             nn.RMSNorm(dim + d), nn.Linear(dim + d, dim), nn.SiLU(), nn.Dropout(c.ev_dropout),
             nn.Linear(dim, d, bias=False))) for h in heads})
         self.cont = nn.Linear(d, 1) if c.cont_head else None                    # N2
+        if c.recon_loss != "pie" and not c.cont_head:
+            raise ValueError("recon_loss mse / zinb 需要 cont_head")
+        self.zi = None
+        if c.recon_loss == "zinb":                                               # v10：零膨胀概率的 logit（初始 π ≈ 0.018）
+            self.zi = nn.Linear(d, 1)
+            nn.init.zeros_(self.zi.weight)
+            nn.init.constant_(self.zi.bias, -4.0)
         self.dec_type = c.dec_type
         if c.dec_type in ("xattn_sa", "affine"):                                 # v7：2 层基因 self-attention
             self.gene_sa = nn.ModuleList([GeneSA(d, c.n_heads, c.ffn_mult) for _ in range(2)])
         if c.dec_type == "affine":                                               # v7：AffineExprDecoder（CellPatch2 newdecoder）
             self.coeff = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, 1), nn.Softplus())
             self.bias = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, 1))
+            if c.nb_resid:
+                raise ValueError("nb_resid 只用于分箱头（dec_type xattn / xattn_sa）")
             if c.affine_id:                                                      # 10-21 修正：初始 ŷ = x（δ = 0）
                 with torch.no_grad():
                     self.coeff[2].weight.zero_()
@@ -516,7 +556,8 @@ class Decoder(nn.Module):
                     self.bias[2].bias.zero_()
 
     def forward(self, z: Tensor, gene_esm: Tensor, evidence: Optional[dict] = None, x: Optional[Tensor] = None):
-        """→ (de_logits, lfc, dp_logits, cont, y_aff)；affine 时 lfc / dp_logits / cont 为 None，y_aff = ŷ [B, G]"""
+        """→ (de_logits, lfc, dp_logits, cont, y_aff, zi)；affine 时 lfc / dp_logits / cont 为 None，y_aff = ŷ [B, G]；
+        zi：v10 zinb 的零膨胀 logit [B, G]（与连续头共用输入），否则 None"""
         q = self.gene_query(gene_esm).expand(z.shape[0], -1, -1)              # [B, G, d]
         fused = None
         if evidence is not None:
@@ -528,14 +569,38 @@ class Decoder(nn.Module):
                 h = blk(h)
         if self.dec_type == "affine":
             y_aff = self.coeff(h).squeeze(-1) * x + self.bias(h).squeeze(-1)
-            return self.de(h), None, None, None, y_aff
+            return self.de(h), None, None, None, y_aff, None
         if fused is None:
             cont = self.cont(h).squeeze(-1) if self.cont is not None else None
-            return self.de(h), self.lfc(h).squeeze(-1), self.dp(h), cont, None
+            zi = self.zi(h).squeeze(-1) if self.zi is not None else None
+            return self.de(h), self.lfc(h).squeeze(-1), self.dp(h), cont, None, zi
         cat = torch.cat([fused, h], dim=-1)
         a = self.out_adapters
-        cont = self.cont(h + a["cont"](cat)).squeeze(-1) if self.cont is not None else None
-        return (self.de(h + a["de"](cat)), self.lfc(h + a["lfc"](cat)).squeeze(-1), self.dp(h + a["dp"](cat)), cont, None)
+        hc = h + a["cont"](cat) if self.cont is not None else None
+        cont = self.cont(hc).squeeze(-1) if self.cont is not None else None
+        zi = self.zi(hc).squeeze(-1) if self.zi is not None else None
+        return (self.de(h + a["de"](cat)), self.lfc(h + a["lfc"](cat)).squeeze(-1), self.dp(h + a["dp"](cat)), cont, None, zi)
+
+
+class PassDecoder(nn.Module):
+    """v11 证据直通 decoder。z [B, p, d]，esm [G, esm_dim]（固定），feat [B, G, F]，base [B, G]（证据，打分空间 δ），s 标量 → δ̂ [B, G]"""
+
+    def __init__(self, c: Config3, n_feat: int, hidden: int = 256) -> None:
+        super().__init__()
+        d = c.d
+        self.gene_query = nn.Linear(c.esm_dim, d)
+        self.query_norm = nn.LayerNorm(d)
+        self.cross = CrossAttn(d, c.n_heads, c.ffn_mult)
+        self.ln = nn.LayerNorm(d)
+        self.mlp = nn.Sequential(nn.Linear(d + n_feat, hidden), nn.SiLU(), nn.Linear(hidden, 2))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, z: Tensor, esm: Tensor, feat: Tensor, base: Tensor, s: float) -> Tensor:
+        q = self.query_norm(self.gene_query(esm)).expand(z.shape[0], -1, -1)   # [B, G, d]
+        h = self.ln(self.cross(q, z))
+        ac = self.mlp(torch.cat([h, feat.to(h.dtype)], dim=-1)).float()        # [B, G, 2]
+        return (1.0 + ac[..., 0]) * base.float() + s * ac[..., 1]
 
 
 def dp_centers(c: Config3, device) -> Tensor:
@@ -588,7 +653,8 @@ def pie_loss(out, labels: dict, c: Config3) -> dict:
     sgn = torch.sign(torch.where(md, lfc_t, torch.zeros_like(lfc_t)))
     dirl = torch.where(md, F.relu(-sgn * pred / c.lfc_dir_tau), torch.zeros_like(pred)).sum() / md.sum().clamp(min=1)
     # dp：两箱软标签交叉熵，每行按软计数的频率倒数加权（上限 cap_dp）
-    probs, valid = two_hot(labels["delta_p"], c)
+    dp_t = labels["delta_p"] if out.dp_base is None else labels["delta_p"] - out.dp_base.float()   # v8：残差目标
+    probs, valid = two_hot(dp_t, c)
     ce = -(probs * F.log_softmax(out.dp_logits.float(), dim=-1)).sum(-1)
     keep = valid.float()
     soft = torch.einsum("bgk,bg->bk", probs, keep)
@@ -611,6 +677,31 @@ def affine_loss(out, labels: dict, c: Config3) -> Tensor:
     w = (keep.sum(1, keepdim=True).clamp(min=1) / (2 * counts.clamp(min=1))).clamp(max=c.class_weight_cap)
     de = (ce * w.gather(1, tgt) * keep).sum() / keep.sum().clamp(min=1)
     return mse + de
+
+
+def bulk_mse(out, labels: dict, s_dp: Tensor) -> Tensor:
+    """v10 mse：MSE(δ̂ / s_dp, δ / s_dp)，δ = 打分空间群体 δ（labels["dB"]）；连续头本身就是 δ̂ / s_dp。只算 labels["gmask"] 的格子。"""
+    m = labels["gmask"]
+    return ((out.dp_cont.float() - labels["dB"].float() / s_dp) ** 2)[m].mean()
+
+
+def zinb_nll(out, labels: dict, s_dp: Tensor, log_theta: Tensor) -> Tensor:
+    """v10 zinb：labels["counts"] [B, n, G] 计数、labels["lib"] [B, n] 文库、labels["bc"] [G] 对照打分空间伪 bulk、labels["gmask"] [B, G]。
+    q̂ = expm1(softplus₅₀(b_c + δ̂)) / 5e4；NB 均值 μ = 文库 · q̂ / (1 − π)；ZINB 负对数似然在 gmask 的格子上平均。"""
+    b = F.softplus(labels["bc"].float() + out.dp_cont.float() * s_dp, beta=50.0)   # 预测的打分空间伪 bulk（> 0）
+    q = torch.expm1(b) / 5e4                                                      # [B, G]
+    zl = out.zi_logit.float()
+    log_pi, log_1mpi = F.logsigmoid(zl), F.logsigmoid(-zl)
+    x = labels["counts"].float()                                                  # [B, n, G]
+    mu = labels["lib"].float()[..., None] * (q * torch.exp(-log_1mpi))[:, None]  # [B, n, G]
+    th = log_theta.float().exp()[None, None]
+    log_th_mu = torch.log(th + mu + 1e-8)
+    nb0 = th * (log_theta.float()[None, None] - log_th_mu)                        # log NB(0)
+    log_nb = (torch.lgamma(x + th) - torch.lgamma(th) - torch.lgamma(x + 1.0) + nb0
+              + x * (torch.log(mu + 1e-8) - log_th_mu))
+    ll = torch.where(x < 0.5, torch.logaddexp(log_pi[:, None], log_1mpi[:, None] + nb0), log_1mpi[:, None] + log_nb)
+    m = labels["gmask"][:, None].expand_as(x)
+    return -ll[m].mean()
 
 
 # ============================================================================
@@ -637,6 +728,8 @@ class Output3:
     nb_c: Optional[Tensor] = None          # [B, K]     N1：目标 c_k（训练时）
     nb_mask: Optional[Tensor] = None       # [B, K]
     y_aff: Optional[Tensor] = None         # [B, G]     v7 affine decoder 的 ŷ
+    dp_base: Optional[Tensor] = None       # [B, G]     v8 nb_resid：残差的基准 nbw（delta_p 单位，停梯度）；δ̂ = dp_base + 分箱读出
+    zi_logit: Optional[Tensor] = None      # [B, G]     v10 zinb：零膨胀概率 π 的 logit
 
 
 def standardize_esm(e: Tensor) -> Tensor:
@@ -699,6 +792,8 @@ class PertFold3(nn.Module):
             self.nb_alpha = nn.Parameter(torch.zeros(()))
         if c.nb_learn or c.cont_head:
             self.register_buffer("s_dp", torch.ones(()))                         # delta_p 的总体标准差（set_scale）
+        if c.recon_loss == "zinb":                                               # v10：每基因 NB 离散度 θ = exp(log_theta)（set_theta 初始化）
+            self.log_theta = nn.Parameter(torch.zeros(c.n_genes))
         if c.recon_weight > 0:                                                   # E1
             self.recon_head = ReconHead(c)
             self.register_buffer("rec_mu", torch.zeros(c.n_genes))
@@ -732,6 +827,11 @@ class PertFold3(nn.Module):
                 child.requires_grad_(name == "decoder" or not freeze_backbone)
         if self.c.freeze_genes:                                                  # A5
             self.gene_table.requires_grad_(False)
+
+    @torch.no_grad()
+    def set_theta(self, theta: Tensor) -> None:
+        """v10 zinb：每基因 NB 离散度的初值（训练脚本按对照细胞矩估计）"""
+        self.log_theta.copy_(theta.float().log())
 
     @torch.no_grad()
     def set_scale(self, s_dp: float) -> None:
@@ -797,6 +897,27 @@ class PertFold3(nn.Module):
         z = enc(x.reshape(-1, x.shape[-1]), self.gene_table(gene_idx))
         return z.reshape(*lead, *z.shape[1:])
 
+    def encode_z(self, gene_idx: Tensor, x: Tensor, relate_x: Tensor, pert_gene: Tensor, relate_genes: Tensor,
+                 relate_x_mask: Optional[Tensor] = None, relate_genes_mask: Optional[Tensor] = None, **_) -> Tensor:
+        """v11：只算 backbone，返回 z [B, p, d]（与 forward 里 decoder 读的 z 相同）"""
+        c = self.c
+        if c.no_encoder or c.input_mask > 0 or c.const_z:
+            raise ValueError("encode_z 不支持 no_encoder / input_mask / const_z")
+        cell_patch_x = self.encode_cell(gene_idx, x)
+        if not c.no_cell_msa:
+            with torch.set_grad_enabled(c.relate_grad and torch.is_grad_enabled()):
+                rel = self.encode_cell(gene_idx, relate_x)
+            cell_patch_x = self.cell_msa(cell_patch_x, rel, relate_x_mask)
+        p = self.encode_pert(pert_gene)
+        if not c.no_pert_msa:
+            with torch.set_grad_enabled(c.relate_grad and torch.is_grad_enabled()):
+                pr = self.encode_pert(relate_genes)
+            p = self.pert_msa(p, pr, relate_genes_mask)
+        z = self.inject(cell_patch_x, p)
+        for blk in self.blocks:
+            z = blk(z)
+        return self.pred_proj(self.pred_norm(z))
+
     def encode_pert(self, pert_gene: Tensor) -> Tensor:
         """pert_gene [...] long → [..., T, d]"""
         return self.pert_emb(self.gene_table(pert_gene)).unflatten(-1, (self.c.n_pert_tokens, self.c.d))
@@ -854,15 +975,23 @@ class PertFold3(nn.Module):
         if evidence is not None:                                                 # 消融：只传模型用到的证据块
             evidence = {k: v for k, v in evidence.items() if k == "ctrl" or k in c.ev_blocks}
         zd = self.z_const.expand(z.shape[0], -1, -1) if c.const_z else z         # 消融：decoder 读常量
-        de_logits, lfc, dp_logits, cont, y_aff = self.decoder(zd, self.gene_table(gene_idx), evidence, x)
+        de_logits, lfc, dp_logits, cont, y_aff, zi = self.decoder(zd, self.gene_table(gene_idx), evidence, x)
         if cont is not None and self.c.nb_direct and dpw is not None:            # N3
             cont = cont + self.nb_alpha * dpw
         if y_aff is not None:                                                    # v7 affine：δ̂ = ŷ − x
             delta = y_aff - x
+        elif c.recon_loss != "pie":                                              # v10：连续头 × s_dp = 打分空间 δ̂
+            delta = cont.float() * self.s_dp
         else:
             delta = dp_centers(self.c, x.device)[dp_logits.argmax(-1)] if self.c.dp_bins > 0 else torch.zeros_like(x)
+        dp_base = None
+        if c.nb_resid:                                                           # v8：δ̂ = nbw + 残差
+            if dpw is None:
+                raise ValueError("nb_resid 需要 nb_learn 且传入 nb")
+            dp_base = (dpw * self.s_dp).detach().to(delta.dtype)
+            delta = delta + dp_base
         return Output3(cell_patch_x, pert_emb_x, h, z, de_logits, lfc, dp_logits, delta, x + delta, cell_patch0, x_rec, x,
-                       cont, dpw, s_nb, None if nb is None else nb.get("c"), None if nb is None else nb["mask"], y_aff)
+                       cont, dpw, s_nb, None if nb is None else nb.get("c"), None if nb is None else nb["mask"], y_aff, dp_base, zi)
 
     def loss(self, out: Output3, gene_idx: Tensor, y: Optional[Tensor] = None,
              labels: Optional[dict] = None) -> Tensor:
@@ -878,14 +1007,26 @@ class PertFold3(nn.Module):
         if c.nb_learn and out.nb_s is not None and out.nb_c is not None and out.nb_mask.any():   # N1：s_k 回归 c_k
             m = out.nb_mask
             loss = loss + c.nb_weight * F.mse_loss(out.nb_s.float()[m], out.nb_c.float()[m])
-        if c.cont_head and c.objective == "recon" and labels is not None and out.dp_cont is not None:   # N2
+        if c.cont_head and c.recon_loss == "pie" and c.objective == "recon" and labels is not None and out.dp_cont is not None:   # N2
             t = labels["delta_p"].float()
             ok = torch.isfinite(t)
             loss = loss + c.cont_weight * F.mse_loss(out.dp_cont.float()[ok], (t / self.s_dp)[ok])
         if c.sigreg_weight > 0 and out.cell_patch0 is not None:                  # J：SIGReg
             loss = loss + c.sigreg_weight * sigreg(out.cell_patch0.float().flatten(1), c.sigreg_slices)
+        if c.mse_weight > 0 and c.objective == "recon" and labels is not None and out.dp_logits is not None:   # v9：δ̂ 的 MSE
+            dh = out.dp_logits.float().softmax(-1) @ dp_centers(c, out.dp_logits.device)
+            if out.dp_base is not None:
+                dh = dh + out.dp_base.float()
+            t = labels["delta_p"].float()
+            ok = torch.isfinite(t)
+            if "nontarget" in labels:
+                ok = ok & labels["nontarget"][None, :]
+            sc = self.s_dp if hasattr(self, "s_dp") else 1.0
+            loss = loss + c.mse_weight * F.mse_loss(dh[ok] / sc, t[ok] / sc)
         if c.disc_weight > 0 and c.objective == "recon" and labels is not None:  # D：区分度 InfoNCE
             dh = (out.dp_logits.float().softmax(-1) @ dp_centers(c, out.dp_logits.device))
+            if out.dp_base is not None:                                          # v9：nb_resid 时 δ̂ = nbw + E[残差]
+                dh = dh + out.dp_base.float()
             tt = torch.nan_to_num(labels["delta_p"].float())
             if "nontarget" in labels:
                 dh, tt = dh[:, labels["nontarget"]], tt[:, labels["nontarget"]]
@@ -908,7 +1049,14 @@ class PertFold3(nn.Module):
                    labels: Optional[dict] = None) -> Tensor:
         c = self.c
         if c.objective == "recon":
-            return affine_loss(out, labels, c) if c.dec_type == "affine" else pie_loss(out, labels, c)["loss"]
+            if c.dec_type == "affine":
+                return affine_loss(out, labels, c)
+            if c.recon_loss == "mse":                                            # v10
+                return bulk_mse(out, labels, self.s_dp)
+            if c.recon_loss == "zinb":
+                return zinb_nll(out, labels, self.s_dp, self.log_theta)
+            d = pie_loss(out, labels, c)                                         # v9：四项可加权（默认全 1 = 原 loss）
+            return c.w_de * d["de_loss"] + c.w_lfc * d["lfc_loss"] + c.w_dir * d["lfc_dir_loss"] + c.w_dp * d["dp_loss"]
         if c.objective != "jepa":
             raise ValueError("objective='mae' 用 mae_loss()")
         zy = None

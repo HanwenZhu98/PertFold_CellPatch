@@ -2,7 +2,20 @@
 
 R4 是 2026-10-20 v6 实验中在 H1 上选出的配置：N1u + mul_std + 阶段 1 "JEPA + EP-IDM + SIGReg"。本目录是它的完整代码与复现入口。
 
-**当前版本 r4-v2（2026-10-22）：简化 decoder 的冗余证据输入。**
+**当前版本 z2（2026-10-23）：Z1 模型（全部基因、打分空间、ZINB、对照重构）与 kNN 混合。**
+- 代码原样复制自 `pertfold/`（2026-10-23），只改了：import 路径指向 `pertfold_r4`；训练默认输出改为 `pertfold_r4/runs`；运行脚本的工作目录改为 `pertfold_r4/scripts`（日志在 `scripts/logs/v12`）。
+- `model_v5.py` 的新增都有开关，默认路径与 r4-v2 逐位相同（2026-10-22 用 predict_h1_v5.py 核对过）。
+- 新增脚本：`train_h1_v12.py`（Z1 训练与预测；`--fold k` 为 5 折，`--ctrl-recon 1.0` 即 Z1）、`prep_v12.py`（数据 `pertfold/data/h1/v12/`）、`eval_bulk_h1.py`（打分空间生成 + cell-eval）、`make_bench_baselines.py`（kNN、A-E 基线）、`merge_folds.py` / `make_ensemble.py` / `make_decode_variants.py` / `make_blend.py`（合并、集成、扣平均、混合）、`pick_variant_cv.py`（交叉拟合选变体）、`summarize_bench.py` / `quick_bench_table.py` / `quick_boot.py`（汇总与 bootstrap）。
+- 后处理脚本仍读 `pertfold/runs3/h1_v12`、`h1_bench` 里存档的预测与打分；用本目录重训后，需把这些脚本里的目录改到 `pertfold_r4/runs/h1_v12`。
+- 运行（5 折，一个种子）：
+  ```bash
+  cd scripts
+  ./run_v12_kfold.sh <GPU> Z1 0 0 1 2 3 4 -- --ctrl-recon 1.0   # 训练 + 预测，每折约 12 分钟
+  ./run_merge_eval.sh Z1_s0                                    # 合并 5 折 → 扫 s → 交叉拟合 → 5 次重复打分
+  ```
+- 存档的结果：`pertfold/runs3/h1_v12/n32/`（Z1 权重在 `fold*/Z1_s*/best_pds.pt`；z2 预测 `pred_Bk50Z1c025_k_rep*.npz`）。实验记录见 `pertfold/docs/reports/NIGHT_1023_brief.md`。
+
+**r4-v2（2026-10-22）：简化 decoder 的冗余证据输入。**
 - decoder 的证据只留 nbw（学习权重加权的邻居 δ / DE / LFC），去掉对照均值特征、ctx（本细胞系其他训练扰动的统计）和 str（STRING 邻居统计）。
 - 证据整类丢弃概率从 0.25 改为 0.015625（= 0.25³）。这样"完全没有证据"的样本比例与原来三类证据同时被丢的比例相同。
 - 理由：
@@ -159,3 +172,4 @@ git switch --detach r4-v1        # 临时切到某个版本（看完 git switch 
 | — | 2026-10-22 | 初始提交：R4 代码原样整理（`878978c`） |
 | `r4-v1` | 2026-10-22 | 原 R4：证据 = 对照均值 + ctx + str + nbw。split_811 PDS 0.736（原跑，重跑 0.711）；5 折 PDS 0.612（kNN 0.605） |
 | `r4-v2` | 2026-10-22 | 简化 decoder 冗余证据输入：只留 nbw，整类丢弃 0.0156。5 折 PDS 0.617（+0.012 相对 kNN；相对 v1 +0.005，不显著） |
+| `z2` | 2026-10-23 | Z1（全部基因 + 打分空间 + ZINB + 对照重构）与 kNN 等权混合。5 折全部基因综合分 0.226（kNN 0.194，+0.031 [+0.015, +0.050]）；PDS 0.674 |

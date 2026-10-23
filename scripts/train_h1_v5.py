@@ -1,4 +1,13 @@
-"""v6 参数（2026-10-20，用户要求：N1u + mul_std 底座上比较阶段 1 的预训练目标；默认全关 = v5）：
+"""v10 参数（2026-10-22 晚，用户要求：统一到打分空间；loss 先 MSE + nb loss，再试 ZINB；默认 = v9）：
+  --space bulk         标签、nbw 证据（邻居 δ）、c_k、输出都改用打分空间群体 δ（data/h1/bulk_sums.npz：全部细胞计数和 →
+                       log1p(5e4 · 比例)，扰动 − 对照）；encoder 输入 x 不变。对照伪 bulk ≤ EXPR_MIN 的基因（约 25%）与本扰动靶基因
+                       不进 loss（labels["gmask"]）。默认 dp（原 delta_p）
+  --recon-loss mse|zinb  阶段 2 的 loss（自动打开 --cont-head）：mse = 打分空间 MSE；zinb = 该扰动 n 个细胞计数的 ZINB 似然
+                       （θ 按对照细胞矩估计初始化）。都加原 nb 打分 loss；DE / LFC / 方向 / 分箱不再进 loss
+  --select mse         阶段 2 按评估扰动上打分空间 MSE（gmask 格子，除以 s_dp²）最低保存 best（stage2_*_best_val_mse.pt）；
+                       默认 pearson_exp（原做法）
+  从 --from-stage1 载入时，stage1.pt 里没有的连续头 / zi 头 / log_theta 用新初始化（阶段 1 不训练 decoder），s_dp 按本空间重设
+v6 参数（2026-10-20，用户要求：N1u + mul_std 底座上比较阶段 1 的预训练目标；默认全关 = v5）：
   --value-enc mul      token = 基因 ⊙ LN(AutoBin(x))；配 --value-norm --norm-bulk 即 mul_std
   --norm-bulk          A1 的标准化统计量改用 bulk：512 个对照 bulk + 512 个训练扰动 bulk（各 n 个细胞）的每基因均值 / 标准差
                        （下限 NORM_BULK_SD_MIN）；encoder 单独测试按"encoder 输入的总体"标准化，这里输入是 bulk。MAE 的重建目标也用它
@@ -87,6 +96,8 @@ NB_K = 10                # 并集候选池的最大邻居数
 STRING_MIN, STRING_K = 0.7, 5   # STRING 证据：直接分阈值与最多邻居数（string_knn.py 中最好的设置）
 MASK_TARGETS = False     # v6：阶段 1 中 y 的靶基因列换成对照均值（--mask-targets）
 NORM_BULK_SD_MIN = 0.01  # v6 --norm-bulk：bulk 标准差的下限（log1p 单位）
+BULK_SUMS = DATA / "bulk_sums.npz"   # v10：打分空间群体伪 bulk（core1022/bulk_sums.py）
+EXPR_MIN = 0.03          # v10：对照打分空间伪 bulk 不超过它的基因视为不表达（约 25% 的基因）
 
 
 class H1Data:
@@ -113,6 +124,8 @@ class H1Data:
         self.aug_sigma = 0.0                                                       # B1：批次增强（build_aug_tables 之后才可用）
         self.ev_mode = "delta"                                                     # B2：证据用 delta 或 fc
         self.depth_match = False                                                   # T1：x 的对照细胞按测序深度与 y 的细胞配对
+        self.space = "dp"                                                          # v10：标签 / 证据空间（use_bulk 后为 bulk）
+        self.need_counts = False                                                   # v10 zinb：batch 另给 y 细胞的计数与文库
         loglib = torch.from_numpy(np.log(np.load(DATA / "lib.npy"))).to(dev)
         self.loglib = loglib
         order = loglib[self.ctrl].argsort()
@@ -131,6 +144,25 @@ class H1Data:
         n_pert_ok = int((out[self.pert_vocab.cpu()].abs().sum(1) > 0).sum())
         print(f"ESM：词表 {n_ok}/{len(self.vocab)} 个基因有表征；扰动靶基因 {n_pert_ok}/{len(self.pert_vocab)}", flush=True)
         return out
+
+    def use_bulk(self):
+        """v10：载入打分空间群体 δ（labels["dB"]）、对照伪 bulk bc [G]、表达掩码 expr [G]、原始文库 lib_raw [细胞]"""
+        z = np.load(BULK_SUMS)
+        self.labels["dB"] = torch.from_numpy(z["dB"].astype(np.float32)).to(self.dev)
+        self.bc = torch.from_numpy(z["B"][-1].astype(np.float32)).to(self.dev)
+        self.expr = self.bc > EXPR_MIN
+        self.lib_raw = torch.from_numpy(np.load(DATA / "lib.npy").astype(np.float32)).to(self.dev)
+        self.space = "bulk"
+
+    def nb_theta(self, k=5000):
+        """v10 zinb：每基因 NB 离散度的矩估计（k 个对照细胞）：1/θ = max(Σ[(c − Lf)² − Lf], 0) / Σ(Lf)²，f = Σc / ΣL"""
+        idx = self.ctrl[torch.randperm(self.ctrl.numel(), device=self.dev)[:k]]
+        L = self.lib_raw[idx][:, None]
+        c = torch.round(torch.expm1(self.X[idx]) * L / 1e4)
+        f = c.sum(0) / L.sum()
+        mu = L * f
+        inv = ((c - mu) ** 2 - mu).sum(0).clamp_min(0) / (mu ** 2).sum(0).clamp_min(1e-8)
+        return (1.0 / inv.clamp_min(1e-4)).clamp(0.01, 1e4)
 
     def bulk(self, pool, k, n):
         """从 pool 中为 k 个 bulk 各随机抽 n 个细胞并平均 → [k, G]（同一 bulk 内不重复）"""
@@ -215,8 +247,14 @@ class H1Data:
         elif self.depth_match:
             x, y = self.matched(perts, n)
         else:
-            y = torch.stack([self.bulk(self.cells[int(p)], 1, n)[0] for p in perts])
             x = None
+            if self.need_counts:                                                 # v10 zinb：同一批 n 个细胞给 y（log 平均）、计数与文库
+                idx = torch.stack([self.cells[int(p)][torch.randperm(self.cells[int(p)].numel(), device=self.dev)[:n]] for p in perts])
+                Xi, Li = self.X[idx], self.lib_raw[idx]                          # [B, n, G]、[B, n]
+                y = Xi.mean(1)
+                counts = torch.round(torch.expm1(Xi) * Li[..., None] / 1e4)
+            else:
+                y = torch.stack([self.bulk(self.cells[int(p)], 1, n)[0] for p in perts])
         lab = {k: v[perts] for k, v in self.labels.items()}
         lab["pid"] = perts                                                       # D：区分度 loss 用（屏蔽同一扰动）
         if not hasattr(self, "nontarget"):
@@ -224,6 +262,13 @@ class H1Data:
             t = self.labels["target"]
             self.nontarget[t[t >= 0]] = False
         lab["nontarget"] = self.nontarget
+        if self.space == "bulk":                                                 # v10：表达且不是本扰动靶基因的格子
+            G = self.X.shape[1]
+            t = self.labels["target"][perts]
+            lab["gmask"] = self.expr[None, :] & (torch.arange(G, device=self.dev)[None, :] != t[:, None])
+            lab["bc"] = self.bc
+            if self.need_counts and not aug and not self.depth_match:
+                lab["counts"], lab["lib"] = counts, Li
         if aug:
             ctrl_b = self.aug_mean(torch.full((B,), len(self.cells), device=self.dev), ls)
             dpa = self.aug_mean(perts, ls) - ctrl_b
@@ -313,7 +358,7 @@ class H1Data:
             sd = x.std(unbiased=False).item() if x.numel() else 1.0
             return sd if sd > 0 else 1.0
 
-        dp = L["delta_p"]
+        dp = L["dB"] if self.space == "bulk" else L["delta_p"]                  # v10：打分空间
         dp_ok = torch.isfinite(dp)
         dp = torch.nan_to_num(dp)
         dp_delta = dp
@@ -347,7 +392,7 @@ class H1Data:
         self.up_f, self.down_f = up.float(), down.float()
         keepc = torch.ones(dp.shape[1], dtype=torch.bool, device=self.dev)
         keepc[L["target"][L["target"] >= 0]] = False
-        Xc = dp_delta[:, keepc].double()                                         # c_k 始终按 delta_p 的相关
+        Xc = dp_delta[:, keepc].double()                                         # c_k 按 delta_p 的相关（--space bulk 时为打分空间 δ）
         Xc = Xc - Xc.mean(1, keepdim=True)
         Xc = Xc / Xc.norm(dim=1, keepdim=True).clamp_min(1e-12)
         self.Cmat = (Xc @ Xc.T).float()
@@ -397,6 +442,7 @@ def diag_eval(model, data, perts, n, draws=4):
     auprc          DE 头的 AUPRC（在已检验基因上汇总，PIE 的选模型指标）"""
     model.eval()
     r, re, ap, rc, rn, zc, zp = [], [], [], [], [], [], []
+    bm, bp, bn = [], [], []
     centers = dp_centers(model.c, data.dev)
     lab = {k: v[perts] for k, v in data.labels.items()}
     for _ in range(draws):
@@ -405,6 +451,8 @@ def diag_eval(model, data, perts, n, draws=4):
             o = model(**inp)
         r.append(pearson_rows(o.delta.float(), lab["delta_p"]).mean().item())
         d_exp = o.delta.float() if o.dp_logits is None else o.dp_logits.float().softmax(-1) @ centers   # v7 affine：连续 δ̂
+        if o.dp_base is not None and o.dp_logits is not None:                    # v8 nb_resid：δ̂ = nbw + E[残差]
+            d_exp = d_exp + o.dp_base.float()
         re.append(pearson_rows(d_exp, lab["delta_p"]).mean().item())
         p_de = o.de_logits.float().softmax(-1)[..., 1]
         ap.append(average_precision(p_de[lab["tested"]], lab["de_mask"][lab["tested"]]))
@@ -415,10 +463,32 @@ def diag_eval(model, data, perts, n, draws=4):
         if o.cell_patch0 is not None:
             zc.append(o.cell_patch0.float().flatten(1))
         zp.append(o.pert_emb_x.float().mean(1))
+        if data.space == "bulk":                                                 # v10：打分空间 MSE / pearson（gmask 格子）
+            m = data.expr[None, :] & (torch.arange(data.X.shape[1], device=data.dev)[None, :] != lab["target"][:, None])
+            t, s_ = lab["dB"], float(model.s_dp)
+            dh = o.dp_cont.float() * s_ if o.dp_cont is not None else o.delta.float()
+            bm.append((((dh - t) / s_) ** 2)[m].mean().item())
+            bp.append(masked_pearson(dh, t, m).mean().item())
+            if o.nbw_dp is not None:
+                bn.append(masked_pearson(o.nbw_dp.float() * s_, t, m)[o.nb_mask.any(1)].mean().item())
     model.train()
     mean = lambda v: sum(v) / len(v) if v else float("nan")  # noqa: E731
     rankme.last = (rank_me(torch.cat(zc)) if zc else float("nan"), rank_me(torch.cat(zp)))
+    bulkdiag.last = {"val_mse": mean(bm), "val_pearson_bulk": mean(bp), "val_pearson_nbw_bulk": mean(bn)} if bm else {}
     return mean(r), mean(re), mean(ap), mean(rc), mean(rn)
+
+
+def masked_pearson(a, b, m):
+    """逐行 pearson，只用 m 为真的列。a、b [B, G]，m [B, G] bool → [B]"""
+    w = m.float()
+    n = w.sum(1, keepdim=True).clamp_min(1)
+    a = (a - (a * w).sum(1, keepdim=True) / n) * w
+    b = (b - (b * w).sum(1, keepdim=True) / n) * w
+    return (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1) + 1e-8)
+
+
+class bulkdiag:                                                                  # v10：diag_eval 最近一次的打分空间指标
+    last = {}
 
 
 def rank_me(z):
@@ -432,7 +502,8 @@ class rankme:                                                                   
     last = (float("nan"), float("nan"))
 
 
-def train_stage(model, data, train, ev, n, steps, lr, log, tag, save=None, eval_every=EVAL_EVERY, best=None, best_cont=None):
+def train_stage(model, data, train, ev, n, steps, lr, log, tag, save=None, eval_every=EVAL_EVERY, best=None, best_cont=None,
+                select="pearson_exp"):
     """save：{步数: 路径}，在这些步数（训练完该步后）保存权重。best：路径，评估扰动上 pearson_exp 最高时保存；
     best_cont：同上，按 pearson_cont（N2 连续头）"""
     best_val = best_c = None
@@ -456,6 +527,8 @@ def train_stage(model, data, train, ev, n, steps, lr, log, tag, save=None, eval_
                 loss = model.loss(o, data.gene_idx, y=y, labels=lab)
             if SAMPLE_LOSS > 0 and model.c.objective == "recon":                # T1：逐样本 δ̂ 对 y − x
                 d_exp = o.dp_logits.float().softmax(-1) @ centers
+                if o.dp_base is not None:                                        # v8 nb_resid
+                    d_exp = d_exp + o.dp_base.float()
                 loss = loss + SAMPLE_LOSS * F.mse_loss(d_exp, (y - inp["x"]).float())
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -470,10 +543,12 @@ def train_stage(model, data, train, ev, n, steps, lr, log, tag, save=None, eval_
                    "eval_pearson_delta": r, "eval_pearson_exp": re, "eval_auprc": ap,
                    "eval_pearson_cont": rc, "eval_pearson_nbw": rn,
                    "eval_rankme_cell": rankme.last[0], "eval_rankme_pert": rankme.last[1], "sec": round(time.time() - t0)}
-            if best and (best_val is None or re > best_val):
-                best_val = re
+            rec.update(bulkdiag.last)
+            crit = -bulkdiag.last["val_mse"] if select == "mse" else re           # v10：--select mse 时按 val MSE（越低越好）
+            if best and (best_val is None or crit > best_val):
+                best_val = crit
                 torch.save(model.state_dict(), best)
-                rec["best_pearson_exp"] = True
+                rec["best_" + ("val_mse" if select == "mse" else "pearson_exp")] = True
             if best_cont and rc == rc and (best_c is None or rc > best_c):
                 best_c = rc
                 torch.save(model.state_dict(), best_cont)
@@ -544,9 +619,19 @@ def main():
     ap.add_argument("--ctrl-jepa", type=float, default=0.0, help="v7：对照 JEPA 的权重（阶段 1）")
     ap.add_argument("--ctrl-jepa-ratio", type=float, default=0.3)
     ap.add_argument("--input-mask", type=float, default=0.0, help="v7：训练时对照输入遮住的基因比例（阶段 2；未给 --input-mask-s1 时两个阶段都用它）")
+    ap.add_argument("--nb-resid", action="store_true", help="v8：分箱头学残差 delta_p − nbw，读出 nbw + E[残差]（需 --nb-learn）")
     ap.add_argument("--affine-id", action="store_true", help="10-21 修正：affine decoder 初始化为不变（ŷ = x）")
     ap.add_argument("--ev-family-dropout", type=float, default=0.25, help="10-21 修正：证据整类丢弃的概率（只留 nbw 时用 0.0156 = 0.25³）")
     ap.add_argument("--input-mask-s1", type=float, default=-1.0, help="v7（用户 10-21）：阶段 1 的输入 mask 比例（如 0.3），阶段 2 用 --input-mask")
+    ap.add_argument("--w-de", type=float, default=1.0, help="v9：pie_loss 各项权重")
+    ap.add_argument("--w-lfc", type=float, default=1.0)
+    ap.add_argument("--w-dir", type=float, default=1.0)
+    ap.add_argument("--w-dp", type=float, default=1.0)
+    ap.add_argument("--mse-dhat", type=float, default=0.0, help="v9：期望读出 δ̂ 对 delta_p 的 MSE 权重")
+    ap.add_argument("--space", default="dp", choices=["dp", "bulk"], help="v10：标签 / 证据 / 输出的空间")
+    ap.add_argument("--recon-loss", default="pie", choices=["pie", "mse", "zinb"], help="v10：阶段 2 的 loss")
+    ap.add_argument("--select", default="pearson_exp", choices=["pearson_exp", "mse"], help="v10：阶段 2 选 best 的指标")
+    ap.add_argument("--from-stage1", default="", help="v9：跳过阶段 1，载入已有 stage1.pt（路径中的 {fold} 换成折号）；需 --s1 0")
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", default=str(RUNS))
     args = ap.parse_args()
@@ -575,6 +660,11 @@ def main():
     if args.aug_sigma > 0 or args.ev_mode == "fc":
         data.build_aug_tables()
     data.aug_sigma = args.aug_sigma
+    if args.space == "bulk":                                                    # v10：打分空间标签（先于 set_evidence，证据也用它）
+        data.use_bulk()
+    elif args.recon_loss != "pie":
+        raise SystemExit("--recon-loss mse / zinb 需要 --space bulk")
+    data.need_counts = args.recon_loss == "zinb"
     data.set_evidence(train, args.relation)
     n_nb = data.str_mask[ev].sum(1).float()
     print(f"关联来源 {args.relation}：评估扰动有邻居 {(n_nb > 0).sum().item()}/{ev.numel()}，"
@@ -594,7 +684,7 @@ def main():
                  freeze_genes=args.freeze_genes, token_ln=args.token_ln, var_weight=args.var_weight, relate_grad=args.relate_grad,
                  recon_weight=args.recon_weight, patch_var_weight=args.patch_var, patch_var_gamma=args.patch_var_gamma,
                  nb_learn=args.nb_learn, nb_feat_dim=int(data.nb_feat.shape[-1]) if args.nb_learn else 0, nb_tau=args.nb_tau,
-                 nb_weight=args.nb_weight, cont_head=args.cont_head, cont_weight=args.cont_weight, nb_direct=args.nb_direct,
+                 nb_weight=args.nb_weight, cont_head=args.cont_head or args.recon_loss != "pie", cont_weight=args.cont_weight, nb_direct=args.nb_direct,
                  pert_var_weight=args.pert_var, slot_attn=args.slot_attn, slot_iters=args.slot_iters,
                  sigreg_weight=args.sigreg, disc_weight=args.disc, disc_tau=args.disc_tau,
                  jepa_mode=args.jepa_mode, idm_weight=args.idm, n_actions=len(data.meta["perts"]) if args.idm > 0 else 0,
@@ -602,7 +692,9 @@ def main():
                  no_encoder=args.no_encoder, no_cell_msa=args.no_cell_msa, no_pert_msa=args.no_pert_msa,
                  ev_drop=args.ev_drop, const_z=args.const_z,
                  dec_type=args.dec_type, ctrl_jepa=args.ctrl_jepa, ctrl_jepa_ratio=args.ctrl_jepa_ratio, input_mask=args.input_mask,
-                 affine_id=args.affine_id, ev_family_dropout=args.ev_family_dropout)
+                 affine_id=args.affine_id, nb_resid=args.nb_resid, ev_family_dropout=args.ev_family_dropout,
+                 w_de=args.w_de, w_lfc=args.w_lfc, w_dir=args.w_dir, w_dp=args.w_dp, mse_weight=args.mse_dhat,
+                 recon_loss=args.recon_loss)
     if args.no_encoder and args.s1 > 0:
         raise SystemExit("--no-encoder 需要 --s1 0（没有可预训练的 encoder）")
     if args.nb_direct and not (args.nb_learn and args.cont_head):
@@ -622,6 +714,7 @@ def main():
             bulk_mu, bulk_sd = bb.mean(0), bb.std(0).clamp_min(NORM_BULK_SD_MIN)
         if args.norm_bulk:
             ctrl_mu, ctrl_sd = bulk_mu, bulk_sd
+    theta0 = data.nb_theta() if args.recon_loss == "zinb" else None            # v10 zinb：θ 初值（对照细胞矩估计）
     rec_mu = rec_sd = None
     if args.recon_weight > 0:                                                   # E1：重建目标按对照 bulk（n 个细胞）的均值 / 标准差标准化
         with torch.no_grad():                                                   # （只在开 E1 时抽样，不改变其他设置的随机数序列）
@@ -633,8 +726,10 @@ def main():
             model.set_value_norm(ctrl_mu, ctrl_sd)
         if args.recon_weight > 0:
             model.set_rec_norm(rec_mu, rec_sd)
-        if args.nb_learn or args.cont_head:
+        if args.nb_learn or args.cont_head or args.recon_loss != "pie":
             model.set_scale(data.s_dp)
+        if theta0 is not None:
+            model.set_theta(theta0)
         if args.mae:
             model.set_mae_norm(bulk_mu, bulk_sd)
         if args.init_cellpatch:                                                 # v6：Tahoe 预训练的 CellPatch（不含标准化缓冲区）
@@ -653,7 +748,8 @@ def main():
                                               "fp32": args.fp32, "sample_loss": args.sample_loss, "wd": args.wd,
                                               "aug_sigma": args.aug_sigma, "ev_mode": args.ev_mode,
                                               "norm_bulk": args.norm_bulk, "mask_targets": args.mask_targets,
-                                              "init_cellpatch": args.init_cellpatch}))
+                                              "init_cellpatch": args.init_cellpatch, "space": args.space,
+                                              "recon_loss": args.recon_loss}))
     save_steps = [int(x) for x in args.save_steps.split(",") if x]
 
     with open(out / "log.jsonl", "w") as log:
@@ -667,11 +763,24 @@ def main():
             init_norms(model)
             train_stage(model, data, train, ev, args.n, args.s1, args.lr1, log, f"stage1_{obj1}", eval_every=args.eval_every)
             torch.save(model.state_dict(), out / "stage1.pt")
+        s1_path = out / "stage1.pt"
+        if args.from_stage1:                                                    # v9：复用已有的阶段 1 权重
+            if args.s1 > 0:
+                raise SystemExit("--from-stage1 需要 --s1 0")
+            obj1 = "jepa"
+            s1_path = Path(args.from_stage1.format(fold=args.fold))
+            model = PertFold3(Config3(objective=obj1, **grid), data.esm).to(dev)
+            init_norms(model)
+            log.write(json.dumps({"from_stage1": str(s1_path)}) + "\n")
         for spec in args.stage2.split(","):
             variant, lr = spec.split(":")[0], float(spec.split(":")[1])
             name = f"{variant}_lr{lr:g}"
-            if args.s1 > 0:
-                model.load_state_dict(torch.load(out / "stage1.pt", map_location=dev))
+            if args.s1 > 0 or args.from_stage1:
+                missing, unexpected = model.load_state_dict(torch.load(s1_path, map_location=dev), strict=False)
+                new = ("decoder.cont.", "decoder.out_adapters.cont.", "decoder.zi.", "log_theta")   # v10：阶段 1 不训练 decoder
+                assert not unexpected and all(k.startswith(new) for k in missing), (missing, unexpected)
+                if args.nb_learn or args.cont_head or args.recon_loss != "pie":   # v10：s_dp 按本次的空间重设（dp 空间时与阶段 1 相同）
+                    model.set_scale(data.s_dp)
                 model.set_objective(obj1)                                   # 恢复全部可训练，再切换
                 model.c = dataclasses.replace(model.c, input_mask=args.input_mask)   # v7：阶段 2 的输入 mask
                 model.set_objective("recon", freeze_backbone=(variant == "freeze"))
@@ -682,9 +791,11 @@ def main():
                 init_norms(model)
             save = {k: out / f"stage2_{name}_step{k}.pt" for k in save_steps}
             save[args.s2] = out / f"stage2_{name}.pt"
+            sel = "val_mse" if args.select == "mse" else "pearson_exp"
             train_stage(model, data, train, ev, args.n, args.s2, lr, log, f"stage2_{name}", save,
-                        eval_every=args.eval_every, best=out / f"stage2_{name}_best_pearson_exp.pt",
-                        best_cont=out / f"stage2_{name}_best_pearson_cont.pt" if args.cont_head else None)
+                        eval_every=args.eval_every, best=out / f"stage2_{name}_best_{sel}.pt",
+                        best_cont=out / f"stage2_{name}_best_pearson_cont.pt" if args.cont_head and args.recon_loss == "pie" else None,
+                        select=args.select)
 
 
 if __name__ == "__main__":
